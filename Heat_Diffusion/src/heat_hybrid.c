@@ -8,6 +8,8 @@
 #define M 100
 #define MAX_ITERS 10000
 #define TOL 1e-3
+#define Ti 10
+#define Tj 10
 
 // Allocate a contiguous 2D array with row pointers
 double **alloc_2d(int n, int m, double **data_block) {
@@ -21,8 +23,15 @@ double **alloc_2d(int n, int m, double **data_block) {
 
 int main(int argc, char **argv) {
     int rank, size;
-    MPI_Init(&argc, &argv);
+    int provided;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    if (provided < MPI_THREAD_MULTIPLE) {
+        if (rank == 0) {
+            fprintf(stderr, "Error: MPI does not provide THREAD_MULTIPLE\n");
+        }
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
     // Row distribution
@@ -41,18 +50,27 @@ int main(int argc, char **argv) {
     double **new_u = alloc_2d(local_rows, M, &new_data);
 
     // Initialize
-    #pragma omp parallel for collapse(2)
-    for (int i = 0; i < local_rows; i++) {
-        for (int j = 0; j < M; j++) {
-            int global_i = global_start + (i - 1);
-
-            if (global_i == 0 || j == M - 1) {
-                u[i][j] = 100.0;   // hot boundary
-            } else {
-                u[i][j] = 0.0;
+    #pragma omp parallel
+    {
+        #pragma omp single
+        {
+            #pragma omp taskloop collapse(2)
+            {
+                for (int i = 0; i < local_rows; i++) {
+                    for (int j = 0; j < M; j++) {
+                        int global_i = global_start + (i - 1);
+        
+                        if (global_i == 0 || j == M - 1) {
+                            u[i][j] = 100.0;   // hot boundary
+                        } else {
+                            u[i][j] = 0.0;
+                        }
+                        new_u[i][j] = u[i][j];
+                    }
+                }
             }
-            new_u[i][j] = u[i][j];
         }
+        #pragma omp taskwait
     }
 
     int iter = 0;
@@ -62,41 +80,110 @@ int main(int argc, char **argv) {
     while (iter < MAX_ITERS && global_diff > TOL) {
         // 1. Exchange ghost rows
         if (rank > 0) {
-            MPI_Sendrecv(u[1], M, MPI_DOUBLE, rank - 1, 0,
-                         u[0], M, MPI_DOUBLE, rank - 1, 0,
-                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            #pragma omp task depend(out: u[0][0:M])
+            {
+                MPI_Sendrecv(u[1], M, MPI_DOUBLE, rank - 1, 0,
+                             u[0], M, MPI_DOUBLE, rank - 1, 0,
+                             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
         }
         if (rank < size - 1) {
-            MPI_Sendrecv(u[local_N], M, MPI_DOUBLE, rank + 1, 0,
-                         u[local_N + 1], M, MPI_DOUBLE, rank + 1, 0,
-                         MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            #pragma omp task depend(out: u[local_N + 1][0:M])
+            {
+                MPI_Sendrecv(u[local_N], M, MPI_DOUBLE, rank + 1, 0,
+                             u[local_N + 1], M, MPI_DOUBLE, rank + 1, 0,
+                             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            }
         }
 
         // 2. Jacobi update
         double local_diff = 0.0;
-        #pragma omp parallel for collapse(2) reduction(max:local_diff)
-        for (int i = 1; i <= local_N; i++) {
-            for (int j = 1; j < M - 1; j++) {
-                int global_i = global_start + (i - 1);
-                if (global_i == 0 || global_i == N - 1) continue;
+        #pragma omp task depend(out: local_diff)
+        {
+            #pragma omp parallel
+            {
+                #pragma omp single
+                #pragma omp taskgroup task_reduction(max: local_diff)
+                {
+                    for (int ii = 1; ii <= local_N; ii += Ti) {
+                        for (int jj = 1; jj < M - 1; jj += Tj) {
+                            int iend = (ii + Ti - 1 < local_N) ? (ii + Ti - 1) : local_N;
+                            int jend = (jj + Tj - 1 < M - 2) ? (jj + Tj - 1) : (M - 2);
 
-                new_u[i][j] = 0.25 * (u[i - 1][j] + u[i + 1][j] +
-                                      u[i][j - 1] + u[i][j + 1]);
-                double d = fabs(new_u[i][j] - u[i][j]);
-                if (d > local_diff) local_diff = d;
+                            // Top boundary tiles (depend on top halo)
+                            if (ii == 1 && rank > 0) {
+                                #pragma omp task depend(in: u[0][0:M]) in_reduction(max: local_diff) shared(u,new_u)
+                                {
+                                    double division_diff = 0.0;
+                                    for (int i = ii; i <= iend; i++) {
+                                        for (int j = jj; j <= jend; j++) {
+                                            double val = 0.25 * (u[i - 1][j] + u[i + 1][j] +
+                                                                u[i][j - 1] + u[i][j + 1]);
+                                            double d = fabs(val - u[i][j]);
+                                            if (d > division_diff) division_diff = d;
+                                            new_u[i][j] = val;
+                                        }
+                                    }
+                                    local_diff = division_diff;
+                                }
+                            }
+                            // Bottom boundary tiles (depend on bottom halo)
+                            else if (iend == local_N && rank < size - 1) {
+                                #pragma omp task depend(in: u[local_N+1][0:M]) in_reduction(max: local_diff) shared(u,new_u)
+                                {
+                                    double division_diff = 0.0;
+                                    for (int i = ii; i <= iend; i++) {
+                                        for (int j = jj; j <= jend; j++) {
+                                            double val = 0.25 * (u[i - 1][j] + u[i + 1][j] +
+                                                                u[i][j - 1] + u[i][j + 1]);
+                                            double d = fabs(val - u[i][j]);
+                                            if (d > division_diff) division_diff = d;
+                                            new_u[i][j] = val;
+                                        }
+                                    }
+                                    local_diff = division_diff;
+                                }
+                            }
+                            // Interior tiles (no halo dependency)
+                            else {
+                                #pragma omp task in_reduction(max: local_diff) shared(u,new_u)
+                                {
+                                    double division_diff = 0.0;
+                                    for (int i = ii; i <= iend; i++) {
+                                        for (int j = jj; j <= jend; j++) {
+                                            double val = 0.25 * (u[i - 1][j] + u[i + 1][j] +
+                                                                u[i][j - 1] + u[i][j + 1]);
+                                            double d = fabs(val - u[i][j]);
+                                            if (d > division_diff) division_diff = d;
+                                            new_u[i][j] = val;
+                                        }
+                                    }
+                                    local_diff = division_diff;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
-
         // 3. Copy back
-        #pragma omp parallel for collapse(2)
-        for (int i = 1; i <= local_N; i++) {
-            for (int j = 1; j < M - 1; j++) {
-                u[i][j] = new_u[i][j];
+        #pragma omp task depend(in: local_diff)
+        {
+            #pragma omp taskloop collapse(2)
+            for (int i = 1; i <= local_N; i++) {
+                for (int j = 1; j < M - 1; j++) {
+                    u[i][j] = new_u[i][j];
+                }
             }
         }
+        
 
         // 4. Global convergence
-        MPI_Allreduce(&local_diff, &global_diff, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        #pragma omp task depend(in: local_diff) depend(out: global_diff)
+        {
+            MPI_Allreduce(&local_diff, &global_diff, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        }
+
 
         iter++;
     }
